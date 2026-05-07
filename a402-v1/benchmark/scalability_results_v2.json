@@ -1,0 +1,131 @@
+{
+  "experiment_name": "Scalability Performance Test",
+  "version": "v2",
+  "description": "Performance metrics for A402 protocol scalability testing including throughput and latency measurements",
+  "test_configuration": {
+    "m_tee_delay_ms": 300,
+    "single_utee_requests": [100, 500, 1000, 2000, 5000, 10000],
+    "multi_utee_replica_counts": [2, 4, 6, 8, 10],
+    "multi_utee_request_count": 1000
+  },
+  "results": {
+    "scalability_throughput_requests_v2": {
+      "figure_name": "scalability_throughput_requests_v2.png",
+      "title": "Throughput vs Number of Requests",
+      "x_axis": {
+        "label": "# Requests",
+        "values": [100, 500, 1000, 2000, 5000, 10000],
+        "scale": "log"
+      },
+      "y_axis": {
+        "label": "Throughput (req/s)",
+        "values": [283.29, 1266.72, 2063.14, 2767.35, 2875.56, 2512.97]
+      },
+      "data_points": [
+        {"requests": 100, "throughput_req_per_s": 283.29},
+        {"requests": 500, "throughput_req_per_s": 1266.72},
+        {"requests": 1000, "throughput_req_per_s": 2063.14},
+        {"requests": 2000, "throughput_req_per_s": 2767.35},
+        {"requests": 5000, "throughput_req_per_s": 2875.56},
+        {"requests": 10000, "throughput_req_per_s": 2512.97}
+      ],
+      "summary": {
+        "max_throughput": 2875.56,
+        "max_throughput_at_requests": 5000,
+        "min_throughput": 283.29,
+        "min_throughput_at_requests": 100,
+        "average_throughput": 1944.84
+      }
+    },
+    "scalability_latency_requests_v2": {
+      "figure_name": "scalability_latency_requests_v2.png",
+      "title": "Latency vs Number of Requests",
+      "x_axis": {
+        "label": "# Requests",
+        "values": [100, 500, 1000, 2000, 5000, 10000],
+        "scale": "log"
+      },
+      "y_axis": {
+        "label": "Average Latency (ms)",
+        "values": [340.555, 340.587, 342.165, 348.745, 372.811, 369.859]
+      },
+      "data_points": [
+        {"requests": 100, "latency_ms": 340.555},
+        {"requests": 500, "latency_ms": 340.587},
+        {"requests": 1000, "latency_ms": 342.165},
+        {"requests": 2000, "latency_ms": 348.745},
+        {"requests": 5000, "latency_ms": 372.811},
+        {"requests": 10000, "latency_ms": 369.859}
+      ],
+      "summary": {
+        "min_latency": 340.555,
+        "min_latency_at_requests": 100,
+        "max_latency": 372.811,
+        "max_latency_at_requests": 5000,
+        "average_latency": 352.287
+      }
+    },
+    "scalability_throughput_replicas_v2": {
+      "figure_name": "scalability_throughput_replicas_v2.png",
+      "title": "Throughput vs Number of Replicas",
+      "x_axis": {
+        "label": "# Replica",
+        "values": [2, 4, 6, 8, 10]
+      },
+      "y_axis": {
+        "label": "Throughput (req/s)",
+        "values": [780.86, 640.18, 584.08, 553.18, 530.49]
+      },
+      "data_points": [
+        {"replicas": 2, "throughput_req_per_s": 780.86},
+        {"replicas": 4, "throughput_req_per_s": 640.18},
+        {"replicas": 6, "throughput_req_per_s": 584.08},
+        {"replicas": 8, "throughput_req_per_s": 553.18},
+        {"replicas": 10, "throughput_req_per_s": 530.49}
+      ],
+      "summary": {
+        "max_throughput": 780.86,
+        "max_throughput_at_replicas": 2,
+        "min_throughput": 530.49,
+        "min_throughput_at_replicas": 10,
+        "average_throughput": 617.758,
+        "trend": "decreasing",
+        "note": "Throughput decreases as number of replicas increases, indicating coordination overhead"
+      }
+    },
+    "scalability_latency_replicas_v2": {
+      "figure_name": "scalability_latency_replicas_v2.png",
+      "title": "Latency vs Number of Replicas",
+      "x_axis": {
+        "label": "# Replica",
+        "values": [2, 4, 6, 8, 10]
+      },
+      "y_axis": {
+        "label": "Average Latency (ms)",
+        "values": [372.626, 374.164, 375.433, 376.528, 377.663]
+      },
+      "data_points": [
+        {"replicas": 2, "latency_ms": 372.626},
+        {"replicas": 4, "latency_ms": 374.164},
+        {"replicas": 6, "latency_ms": 375.433},
+        {"replicas": 8, "latency_ms": 376.528},
+        {"replicas": 10, "latency_ms": 377.663}
+      ],
+      "summary": {
+        "min_latency": 372.626,
+        "min_latency_at_replicas": 2,
+        "max_latency": 377.663,
+        "max_latency_at_replicas": 10,
+        "average_latency": 375.283,
+        "trend": "increasing",
+        "note": "Latency increases slightly as number of replicas increases, but remains relatively stable"
+      }
+    }
+  },
+  "experimental_notes": {
+    "test_environment": "M-TEE delay set to 300ms to simulate realistic network conditions",
+    "measurement_method": "Performance metrics measured under steady-state conditions",
+    "figure_format": "Paper-ready format with Times New Roman font, no legends, black lines",
+    "generation_date": "Generated from plot_scalability_main.py"
+  }
+}

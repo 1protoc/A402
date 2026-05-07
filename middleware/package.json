@@ -1,0 +1,77 @@
+{
+  "name": "a402-express",
+  "version": "0.1.1",
+  "description": "Express middleware that serves paid APIs through the A402 privacy-first x402 facilitator. Drop-in replacement for x402 sellers that want their settlements hidden behind a TEE vault.",
+  "license": "ISC",
+  "author": "A402",
+  "homepage": "https://github.com/A402/privacy-x402#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/A402/privacy-x402.git",
+    "directory": "middleware"
+  },
+  "bugs": {
+    "url": "https://github.com/A402/privacy-x402/issues"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js"
+    },
+    "./asc": {
+      "types": "./dist/asc.d.ts",
+      "require": "./dist/asc.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.4.0",
+    "@noble/hashes": "^1.4.0",
+    "@solana-program/token": "^0.13.0",
+    "@solana/kit": "^6.8.0"
+  },
+  "peerDependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@solana/web3.js": "^1.95.0",
+    "express": "^4.0.0 || ^5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@coral-xyz/anchor": {
+      "optional": true
+    },
+    "@solana/web3.js": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@solana/web3.js": "^1.95.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "x402",
+    "a402",
+    "solana",
+    "express",
+    "middleware",
+    "privacy",
+    "payment",
+    "tee"
+  ]
+}
