@@ -1,0 +1,35 @@
+[package]
+name = "a402-shared"
+version = "0.1.0"
+edition = "2021"
+description = "Modules shared between the A402 Vault (enclave/) and Service Provider (service_provider/) binaries: secp256k1 Schnorr adaptor signatures, ASCManager ABI encoders, EIP-1559 tx signing, EVM channel store."
+
+[lib]
+name = "a402_shared"
+path = "src/lib.rs"
+
+[dependencies]
+# Crypto / hashing
+k256 = { version = "0.13", features = ["arithmetic", "ecdsa"] }
+sha3 = "0.10"
+sha2 = "0.10"
+rand = "0.8"
+aes-gcm = "0.10"
+
+# Serde + error plumbing
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_bytes = "0.11"
+thiserror = "2"
+
+# Async + HTTP for EvmRpcClient
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+reqwest = { version = "0.12", features = ["json"] }
+
+# Misc
+hex = "0.4"
+dashmap = "6"
+
+# Bitcoin: rust-bitcoin (which re-exports secp256k1) — used by btc_tx /
+# btc_chain to build + sign batch settlement transactions in-enclave.
+bitcoin = { version = "0.32", features = ["serde"] }

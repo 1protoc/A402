@@ -1,7 +1,6 @@
 //! Atomic Service Channel (ASC) Lifecycle Manager — Phase 3
 //!
-//! Per design doc §5.4 and §5.5 (A402 Algorithm 1 & 2):
-//!   Open → Lock (request submitted) → Pending (adaptor verified) → Closed (settled)
+//! //!   Open → Lock (request submitted) → Pending (adaptor verified) → Closed (settled)
 //!
 //! The ASC manager handles:
 //!   - Channel open/close lifecycle

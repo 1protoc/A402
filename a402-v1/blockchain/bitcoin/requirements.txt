@@ -1,2 +1,0 @@
-requests
-base58==2.31.0

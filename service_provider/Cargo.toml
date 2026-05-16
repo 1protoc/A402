@@ -1,0 +1,37 @@
+[package]
+name = "a402-service-provider"
+version = "0.1.0"
+edition = "2021"
+description = "A402 Service Provider (S) Rust binary — the TEE-bound counterpart to the Vault (U) in `enclave/`. It has its own keypair, code hash, and attestation; it never shares keys with U."
+
+[[bin]]
+name = "a402-service-provider"
+path = "src/main.rs"
+
+[dependencies]
+# Protocol shared with enclave/ (Schnorr math, ABI, EIP-1559 tx, channel store)
+a402-shared = { path = "../shared" }
+
+# HTTP server + JSON
+axum = { version = "0.7", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Crypto
+k256 = { version = "0.13", features = ["arithmetic", "ecdsa"] }
+sha3 = "0.10"
+rand = "0.8"
+
+# Plumbing
+hex = "0.4"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+dashmap = "6"
+
+[dev-dependencies]
+# Used by tests/anvil_paper_flow.rs to play the Client role end-to-end.
+a402-client = { path = "../client" }
+base64 = "0.22"

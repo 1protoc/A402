@@ -1,7 +1,6 @@
 //! ElGamal Encryption + Hierarchical Key Derivation for Audit Records
 //!
-//! Per design doc §2.4 and §5.7:
-//!   - Master auditor secret → per-provider derived secret via HKDF
+//! //!   - Master auditor secret → per-provider derived secret via HKDF
 //!   - Each audit record encrypted with provider-specific ElGamal public key
 //!   - Selective disclosure: reveal derived key for specific provider only
 //!
@@ -110,8 +109,7 @@ pub fn elgamal_decrypt(secret_key: &Scalar, ciphertext: &[u8; 64]) -> Option<[u8
 
 /// Generate an encrypted audit record for a settlement.
 ///
-/// Per design doc §5.7:
-///   - Encrypt sender pubkey with provider-derived ElGamal key
+/// ///   - Encrypt sender pubkey with provider-derived ElGamal key
 ///   - Encrypt amount (padded to 32 bytes) with same key
 ///   - Provider address is stored in plaintext (receiver is public)
 pub fn generate_audit_record(

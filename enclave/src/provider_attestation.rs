@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use solana_sdk::pubkey::Pubkey;
 use std::collections::BTreeMap;
 
-const AWS_NITRO_ROOT_G1_PEM: &str = include_str!("../../sdk/assets/aws_nitro_root_g1.pem");
+const AWS_NITRO_ROOT_G1_PEM: &str = include_str!("../assets/aws_nitro_root_g1.pem");
 const COSE_SIGN1_TAG: u64 = 18;
 const COSE_ALG_ES256: i128 = -7;
 const COSE_ALG_ES384: i128 = -35;

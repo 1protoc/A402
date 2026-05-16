@@ -15,7 +15,7 @@ use crate::error::EnclaveError;
 /// Unique channel identifier
 pub type ChannelId = String;
 
-/// ASC channel status (A402 Algorithm 1)
+/// ASC channel status
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChannelStatus {
     /// Channel open, accepting requests
@@ -36,7 +36,7 @@ pub struct ChannelBalance {
     pub provider_earned: u64,
 }
 
-/// Active Service Channel state (enclave-only, per design doc §5.4)
+/// Active Service Channel state (enclave-only, )
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelState {
     pub channel_id: ChannelId,

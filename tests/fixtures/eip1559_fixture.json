@@ -1,0 +1,37 @@
+{
+  "comment": "deterministic EIP-1559 cross-stack fixture; produced by viem (gen-eip1559-fixture.js)",
+  "privateKey": "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+  "signerAddress": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+  "tx": {
+    "chainId": 31337,
+    "nonce": 7,
+    "maxPriorityFeePerGas": "1000000000",
+    "maxFeePerGas": "2000000000",
+    "gasLimit": "100000",
+    "to": "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9",
+    "value": "0",
+    "data": "0xabcdef"
+  },
+  "unsigned": "0x02ed827a6907843b9aca008477359400830186a094cf7ed3acca5a467e9e704c703e8d87f634fb0fc98083abcdefc0",
+  "signed": "0x02f870827a6907843b9aca008477359400830186a094cf7ed3acca5a467e9e704c703e8d87f634fb0fc98083abcdefc001a0bbc335b35736bf817bd8a7baa97c789b8b05927438721a72b6663a5fc8800299a03cf4a4f3842377df97e4eb79f4e7370d2be5fdaf588f408d9abdd520c93f44fa",
+  "signature": {
+    "r": "0xbbc335b35736bf817bd8a7baa97c789b8b05927438721a72b6663a5fc8800299",
+    "s": "0x3cf4a4f3842377df97e4eb79f4e7370d2be5fdaf588f408d9abdd520c93f44fa",
+    "v": 28,
+    "yParity": 1
+  },
+  "parsedSigned": {
+    "r": "0xbbc335b35736bf817bd8a7baa97c789b8b05927438721a72b6663a5fc8800299",
+    "s": "0x3cf4a4f3842377df97e4eb79f4e7370d2be5fdaf588f408d9abdd520c93f44fa",
+    "v": "28",
+    "yParity": 1,
+    "chainId": 31337,
+    "type": "eip1559",
+    "to": "0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9",
+    "gas": "100000",
+    "data": "0xabcdef",
+    "nonce": 7,
+    "maxFeePerGas": "2000000000",
+    "maxPriorityFeePerGas": "1000000000"
+  }
+}

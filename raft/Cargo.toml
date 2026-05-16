@@ -1,0 +1,39 @@
+[package]
+name = "a402-raft"
+version = "0.1.0"
+edition = "2021"
+description = "Raft committee runtime for the A402 Vault. Replicates WAL events across 4 TEE peers so any 3 alive can keep the channel-state machine live. Single-node operation remains available when A402_RAFT_PEERS is empty."
+
+[lib]
+name = "a402_raft"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime + traits
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# openraft: pure-Rust Raft, async, current 0.9 line.
+openraft = { version = "0.9", features = ["serde"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# HTTP RPC transport (axum on the receive side, reqwest on the send side)
+axum = { version = "0.7", features = ["json"] }
+reqwest = { version = "0.12", features = ["json"] }
+
+# Plumbing
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = "0.3"
+openraft = { version = "0.9", features = ["serde"] }

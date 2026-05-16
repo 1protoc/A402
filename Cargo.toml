@@ -4,6 +4,10 @@ members = [
     "enclave",
     "parent",
     "watchtower",
+    "shared",
+    "service_provider",
+    "client",
+    "raft",
 ]
 resolver = "2"
 

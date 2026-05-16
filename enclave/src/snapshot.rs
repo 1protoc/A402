@@ -692,6 +692,7 @@ mod tests {
             attestation_is_local_dev: true,
             provider_mtls_enabled: false,
             outbound: crate::outbound::OutboundTransport::direct(),
+            btc_ledger: tokio::sync::RwLock::new(crate::btc_ledger::BtcUtxoLedger::new()),
         })
     }
 

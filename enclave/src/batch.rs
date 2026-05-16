@@ -415,7 +415,7 @@ async fn fire_batch_at(
     }
 
     if !multichain_prepared.is_empty() {
-        let receipts = submit_multichain_batches(&multichain_prepared, batch_id).await?;
+        let receipts = submit_multichain_batches(&multichain_prepared, batch_id, state).await?;
         for receipt in receipts {
             let settlement_ids = receipt.settlement_ids.clone();
             let tx_signature = format!("{:?}:{}:{}", receipt.chain_kind, receipt.network, receipt.tx_id);

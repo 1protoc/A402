@@ -9,6 +9,8 @@ path = "src/main.rs"
 
 [dependencies]
 a402_vault = { path = "../programs/a402_vault", features = ["cpi"] }
+a402-shared = { path = "../shared" }
+a402-raft = { path = "../raft" }
 async-trait = "0.1"
 axum = { version = "0.7", features = ["json"] }
 bytes = "1"
@@ -24,6 +26,12 @@ base64 = "0.22"
 sha2 = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 curve25519-dalek = { version = "4", features = ["rand_core"] }
+# secp256k1 stack for the EVM adaptor signature module. `k256` is the pure-Rust
+# implementation maintained by RustCrypto; we use its low-level Scalar /
+# ProjectivePoint API to match the JS adaptor's noot-style Schnorr math.
+k256 = { version = "0.13", features = ["arithmetic", "ecdsa"] }
+# Keccak-256 for the EVM challenge hash + Ethereum address derivation.
+sha3 = "0.10"
 hkdf = "0.12"
 rand = "0.8"
 uuid = { version = "1", features = ["v7"] }

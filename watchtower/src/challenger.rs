@@ -4,7 +4,7 @@
 //! stale receipt nonce (lower than what we have stored), automatically submits
 //! a force_settle_challenge transaction with the newer receipt.
 //!
-//! Per design doc §4.5: "Receipt Watchtower is MANDATORY for Phase 4 onwards."
+//! "Receipt Watchtower is MANDATORY for Phase 4 onwards."
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;

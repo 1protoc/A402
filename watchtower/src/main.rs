@@ -1,6 +1,6 @@
 //! A402 Receipt Watchtower
 //!
-//! Per design doc §4.5: Stores latest ParticipantReceipts per participant and
+//! Stores latest ParticipantReceipts per participant and
 //! automatically challenges stale receipts during force_settle disputes.
 //!
 //! Components:

@@ -1,6 +1,6 @@
 //! Deposit Detection: Monitor on-chain deposit events and update enclave state.
 //!
-//! Per design doc §5.6, the enclave monitors on-chain deposit instructions via
+//! , the enclave monitors on-chain deposit instructions via
 //! Solana RPC (WebSocket logsSubscribe) and updates client balances after the
 //! transaction reaches `finalized` commitment.
 //!
@@ -316,8 +316,7 @@ where
 
 /// Catch-up on deposits missed during a WebSocket disconnection.
 ///
-/// Per design doc §5.6:
-///   1. getSignaturesForAddress(vault_token_account, until=last_processed)
+/// ///   1. getSignaturesForAddress(vault_token_account, until=last_processed)
 ///   2. For each signature, getTransaction to parse deposit data
 ///   3. Skip WAL-recorded deposits
 ///   4. Apply new deposits to client_balances

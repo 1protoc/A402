@@ -146,7 +146,7 @@ pub fn handler<'info>(
 /// Verify that a settle_vault instruction exists in the same transaction
 /// with matching batch_id and batch_chunk_hash.
 ///
-/// Per design doc §6.3: record_audit must be paired with settle_vault.
+/// record_audit must be paired with settle_vault.
 /// Standalone execution is rejected.
 fn verify_settle_vault_pairing(
     instructions_sysvar: &AccountInfo,

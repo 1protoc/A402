@@ -1,11 +1,19 @@
+use a402_shared::bitcoin::{Address, Network};
+use a402_shared::btc_chain::BtcRpcClient;
+use a402_shared::btc_tx::{build_settlement_tx, BtcKeys, Payout, VaultUtxo};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::str::FromStr;
 
+use crate::btc_ledger::UtxoKey;
 use crate::chain_adapter::{parse_network, ChainKind};
+use crate::handlers::AppState;
+use crate::wal::WalEntry;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct MultiChainSettlementEntry {
@@ -37,6 +45,7 @@ struct AggregatedPayout {
 pub async fn submit_multichain_batches(
     entries: &[MultiChainSettlementEntry],
     batch_id: u64,
+    state: &Arc<AppState>,
 ) -> Result<Vec<MultiChainBatchReceipt>, String> {
     let mut groups = BTreeMap::<(ChainKind, String, String), Vec<MultiChainSettlementEntry>>::new();
     for entry in entries {
@@ -54,8 +63,9 @@ pub async fn submit_multichain_batches(
             ChainKind::Solana => continue,
             ChainKind::Ethereum => submit_ethereum_batch(&network, &asset_id, &group, batch_id)
                 .await?,
-            ChainKind::Bitcoin => submit_bitcoin_batch(&network, &asset_id, &group, batch_id)
-                .await?,
+            ChainKind::Bitcoin => {
+                submit_bitcoin_batch(&network, &asset_id, &group, batch_id, state).await?
+            }
         };
         receipts.push(receipt);
     }
@@ -211,102 +221,203 @@ fn u256_from_u64(value: u64) -> [u8; 32] {
     out
 }
 
+/// Submits a Bitcoin batch settlement using the in-enclave secp256k1 key.
+///
+/// Replaces the legacy `walletcreatefundedpsbt + walletprocesspsbt +
+/// finalizepsbt` pipeline (which kept private keys in bitcoind's wallet).
+/// Now the Vault:
+///   1. Loads `sk_BTC` from `A402_BITCOIN_VAULT_PRIV` (KMS-bound in prod).
+///   2. Picks UTXOs paid to its own P2WPKH address via `listunspent`.
+///   3. Builds the tx + signs every input in-process via
+///      `a402_shared::btc_tx::build_settlement_tx`.
+///   4. Hands the raw signed tx to bitcoind via `sendrawtransaction`.
+/// bitcoind never sees the vault private key.
 async fn submit_bitcoin_batch(
     network: &str,
     asset_id: &str,
     entries: &[MultiChainSettlementEntry],
     batch_id: u64,
+    state: &Arc<AppState>,
 ) -> Result<MultiChainBatchReceipt, String> {
     if !asset_id.eq_ignore_ascii_case("btc") && !asset_id.eq_ignore_ascii_case("native") {
         return Err(format!("unsupported Bitcoin asset id: {asset_id}"));
     }
 
+    let net = parse_bitcoin_network(network)?;
     let rpc_url = std::env::var("A402_BITCOIN_RPC_URL")
         .map_err(|_| "A402_BITCOIN_RPC_URL is required for Bitcoin settlement".to_string())?;
-    let rpc_user = std::env::var("A402_BITCOIN_RPC_USER").ok();
-    let rpc_password = std::env::var("A402_BITCOIN_RPC_PASSWORD").ok();
-    let fee_rate = std::env::var("A402_BITCOIN_FEE_RATE")
+    let rpc_user = std::env::var("A402_BITCOIN_RPC_USER").unwrap_or_default();
+    let rpc_password = std::env::var("A402_BITCOIN_RPC_PASSWORD").unwrap_or_default();
+    let vault_priv = std::env::var("A402_BITCOIN_VAULT_PRIV").map_err(|_| {
+        "A402_BITCOIN_VAULT_PRIV (32-byte hex secp256k1 secret) is required for Bitcoin settlement"
+            .to_string()
+    })?;
+    let fee_rate_sat_per_vb = std::env::var("A402_BITCOIN_FEE_RATE")
         .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(2.0);
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(2.0)
+        .max(1.0);
 
-    let payouts = aggregate_payouts(entries)?;
-    let commitment = batch_commitment(b"A402-BTC-BATCH-V1", batch_id, network, asset_id, entries);
-    let mut outputs = Vec::with_capacity(payouts.len() + 1);
-    outputs.push(json!({ "data": hex::encode(commitment) }));
-    for payout in &payouts {
-        outputs.push(json!({
-            payout.settlement_address.clone(): sats_to_btc(payout.amount)
-        }));
+    let keys = BtcKeys::from_hex(&vault_priv, net)
+        .map_err(|e| format!("A402_BITCOIN_VAULT_PRIV invalid: {e}"))?;
+    let vault_addr = keys.p2wpkh_address();
+    let vault_addr_str = vault_addr.to_string();
+
+    // Aggregate per-provider then parse each settlement address against the
+    // network we resolved from `network`. Refuse mismatched addresses early.
+    let aggregated = aggregate_payouts(entries)?;
+    let mut payouts: Vec<Payout> = Vec::with_capacity(aggregated.len());
+    for ap in &aggregated {
+        let addr_unchecked = Address::from_str(&ap.settlement_address)
+            .map_err(|e| format!("invalid provider address {}: {e}", ap.settlement_address))?;
+        let addr = addr_unchecked.require_network(net).map_err(|e| {
+            format!("address {} not on {network}: {e}", ap.settlement_address)
+        })?;
+        payouts.push(Payout {
+            address: addr,
+            amount_sat: ap.amount,
+        });
     }
+    let total_out_sat: u64 = payouts.iter().map(|p| p.amount_sat).sum();
 
-    let options = json!({
-        "fee_rate": fee_rate,
-        "subtractFeeFromOutputs": [],
-        "replaceable": true,
-    });
-    let psbt: String = bitcoin_rpc(
-        &rpc_url,
-        rpc_user.as_deref(),
-        rpc_password.as_deref(),
-        "walletcreatefundedpsbt",
-        json!([[], outputs, 0, options, true]),
-    )
-    .await?
-    .get("psbt")
-    .and_then(|value| value.as_str())
-    .ok_or_else(|| "walletcreatefundedpsbt response missing psbt".to_string())?
-    .to_string();
+    let rpc = BtcRpcClient::new(rpc_url, rpc_user, rpc_password);
+    let _ = vault_addr_str; // silence unused: we no longer query bitcoind for vault funds
 
-    let processed: String = bitcoin_rpc(
-        &rpc_url,
-        rpc_user.as_deref(),
-        rpc_password.as_deref(),
-        "walletprocesspsbt",
-        json!([psbt]),
-    )
-    .await?
-    .get("psbt")
-    .and_then(|value| value.as_str())
-    .ok_or_else(|| "walletprocesspsbt response missing psbt".to_string())?
-    .to_string();
+    let est_vbytes = estimate_vbytes(payouts.len(), /* n_inputs */ 1);
+    let mut fee_sat = (fee_rate_sat_per_vb * est_vbytes as f64).ceil() as u64;
+    fee_sat = fee_sat.max(500); // cheap floor — testnets occasionally need it
+    let needed = total_out_sat + fee_sat;
 
-    let finalized = bitcoin_rpc(
-        &rpc_url,
-        rpc_user.as_deref(),
-        rpc_password.as_deref(),
-        "finalizepsbt",
-        json!([processed]),
-    )
-    .await?;
-    if finalized.get("complete").and_then(|value| value.as_bool()) != Some(true) {
-        return Err("Bitcoin PSBT was not fully signed by enclave wallet".to_string());
+    // Slice 3C: source the input UTXO from the Vault's own WAL-tracked
+    // ledger instead of trusting bitcoind's `listunspent`. Slice 3B's
+    // deposit detector keeps the ledger fed.
+    let utxo = state
+        .btc_ledger
+        .read()
+        .await
+        .pick_single(needed)
+        .map_err(|e| format!("btc_ledger.pick_single: {e}"))?;
+    let change_sat = utxo.value_sat - total_out_sat - fee_sat;
+    let commit_hash =
+        batch_commitment(b"A402-BTC-BATCH-V1", batch_id, network, asset_id, entries);
+    let tx = build_settlement_tx(&commit_hash, &payouts, &[utxo.clone()], &vault_addr, fee_sat, &keys)
+        .map_err(|e| format!("build_settlement_tx: {e}"))?;
+
+    let txid = rpc
+        .sendrawtransaction(&tx)
+        .await
+        .map_err(|e| format!("sendrawtransaction: {e}"))?;
+
+    // After the broadcast succeeds, durably book-keep the spent input and
+    // the produced change output so the ledger can survive an enclave
+    // restart. WAL-first, then in-memory ledger.
+    let _persist_guard = state.persistence_lock.lock().await;
+    state
+        .wal
+        .append(WalEntry::BtcUtxoSpent {
+            txid: utxo.txid.to_string(),
+            vout: utxo.vout,
+            in_settlement_txid: txid.to_string(),
+        })
+        .await
+        .map_err(|e| format!("wal append BtcUtxoSpent: {e}"))?;
+    state
+        .btc_ledger
+        .write()
+        .await
+        .spend(&UtxoKey::new(utxo.txid, utxo.vout))
+        .map_err(|e| format!("btc_ledger.spend: {e}"))?;
+    // `build_settlement_tx` emits a change output iff change_sat >= 1_000.
+    // Output layout is `[0]=OP_RETURN | [1..1+N]=payouts | [N+1]=change?`.
+    if change_sat >= 1_000 {
+        let change_vout = (1 + payouts.len()) as u32;
+        state
+            .wal
+            .append(WalEntry::BtcChangeCreated {
+                txid: txid.to_string(),
+                vout: change_vout,
+                value_sat: change_sat,
+            })
+            .await
+            .map_err(|e| format!("wal append BtcChangeCreated: {e}"))?;
+        state
+            .btc_ledger
+            .write()
+            .await
+            .add(UtxoKey::new(txid, change_vout), change_sat)
+            .map_err(|e| format!("btc_ledger.add(change): {e}"))?;
     }
-    let hex = finalized
-        .get("hex")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "finalizepsbt response missing hex".to_string())?;
-
-    let txid: String = bitcoin_rpc(
-        &rpc_url,
-        rpc_user.as_deref(),
-        rpc_password.as_deref(),
-        "sendrawtransaction",
-        json!([hex]),
-    )
-    .await?
-    .as_str()
-    .ok_or_else(|| "sendrawtransaction response missing txid".to_string())?
-    .to_string();
+    drop(_persist_guard);
 
     Ok(MultiChainBatchReceipt {
         chain_kind: ChainKind::Bitcoin,
         network: network.to_string(),
-        tx_id: txid,
+        tx_id: txid.to_string(),
         settlement_ids: entries.iter().map(|entry| entry.settlement_id.clone()).collect(),
         provider_count: payouts.len(),
         total_amount: entries.iter().map(|entry| entry.amount).sum(),
     })
+}
+
+fn parse_bitcoin_network(network: &str) -> Result<Network, String> {
+    let tail = network
+        .strip_prefix("bitcoin:")
+        .ok_or_else(|| format!("expected 'bitcoin:<net>', got {network}"))?;
+    match tail {
+        "mainnet" => Ok(Network::Bitcoin),
+        "testnet" => Ok(Network::Testnet),
+        "signet" => Ok(Network::Signet),
+        "regtest" => Ok(Network::Regtest),
+        other => Err(format!("unknown Bitcoin network: {other}")),
+    }
+}
+
+/// Pick the smallest UTXO covering `needed`. If none does, error out — the
+/// slice-2 path only spends one UTXO per batch. Multi-UTXO selection ships
+/// with slice 3 (WAL-tracked UTXO set).
+fn pick_utxo(unspent: &[Value], needed: u64) -> Result<VaultUtxo, String> {
+    let mut candidates: Vec<VaultUtxo> = Vec::new();
+    for entry in unspent {
+        let txid_str = entry
+            .get("txid")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "listunspent entry missing txid".to_string())?;
+        let vout = entry
+            .get("vout")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "listunspent entry missing vout".to_string())? as u32;
+        let amount_btc = entry
+            .get("amount")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| "listunspent entry missing amount".to_string())?;
+        let value_sat = (amount_btc * 100_000_000.0).round() as u64;
+        let txid = txid_str
+            .parse::<a402_shared::bitcoin::Txid>()
+            .map_err(|e| format!("listunspent txid parse {txid_str}: {e}"))?;
+        candidates.push(VaultUtxo {
+            txid,
+            vout,
+            value_sat,
+        });
+    }
+    candidates.sort_by_key(|u| u.value_sat);
+    candidates
+        .into_iter()
+        .find(|u| u.value_sat >= needed)
+        .ok_or_else(|| {
+            format!(
+                "no single UTXO covers {needed} sats — multi-UTXO selection lands in slice 3"
+            )
+        })
+}
+
+/// Approximate vbyte count for a Vault settlement transaction:
+///   `10` (overhead) + `68 × n_inputs` (P2WPKH) + `12` (OP_RETURN 32B) +
+///   `31 × (n_payouts + 1 change)` P2WPKH outputs.
+fn estimate_vbytes(n_payouts: usize, n_inputs: usize) -> u64 {
+    let inputs = 68u64 * n_inputs as u64;
+    let outputs = 31u64 * (n_payouts as u64 + 1); // payouts + change
+    10 + inputs + 12 + outputs
 }
 
 fn sats_to_btc(sats: u64) -> f64 {
@@ -401,6 +512,71 @@ mod tests {
         assert!(calldata.starts_with("0x"));
         assert!(calldata.contains("1111111111111111111111111111111111111111"));
         assert!(calldata.ends_with("000000000000000000000000"));
+    }
+
+    #[test]
+    fn parses_bitcoin_network_strings() {
+        assert!(matches!(
+            parse_bitcoin_network("bitcoin:mainnet"),
+            Ok(Network::Bitcoin)
+        ));
+        assert!(matches!(
+            parse_bitcoin_network("bitcoin:testnet"),
+            Ok(Network::Testnet)
+        ));
+        assert!(matches!(
+            parse_bitcoin_network("bitcoin:signet"),
+            Ok(Network::Signet)
+        ));
+        assert!(matches!(
+            parse_bitcoin_network("bitcoin:regtest"),
+            Ok(Network::Regtest)
+        ));
+        // Bad prefix and bad tail both rejected.
+        assert!(parse_bitcoin_network("eth:mainnet").is_err());
+        assert!(parse_bitcoin_network("bitcoin:dogenet").is_err());
+    }
+
+    #[test]
+    fn estimates_vbytes_within_5_pct_of_reference() {
+        // Reference (computed by hand from BIP-141 weight units, see
+        // vbyte estimate based on standard BIP-141 weight units:
+        //   1 input, 0 payouts (only OP_RETURN + change) → 10 + 68 + 12 + 31 = 121
+        //   1 input, 1 payout                            → 10 + 68 + 12 + 62 = 152
+        //   1 input, 4 payouts                           → 10 + 68 + 12 + 155 = 245
+        //   2 inputs, 4 payouts                          → 10 + 136 + 12 + 155 = 313
+        assert_eq!(estimate_vbytes(0, 1), 121);
+        assert_eq!(estimate_vbytes(1, 1), 152);
+        assert_eq!(estimate_vbytes(4, 1), 245);
+        assert_eq!(estimate_vbytes(4, 2), 313);
+    }
+
+    #[test]
+    fn picks_smallest_utxo_covering_amount() {
+        // listunspent-shaped entries: txid (any 32-byte hex), vout, amount BTC.
+        let unspent = vec![
+            json!({
+                "txid": "0000000000000000000000000000000000000000000000000000000000000001",
+                "vout": 0,
+                "amount": 0.001,    // 100_000 sats
+            }),
+            json!({
+                "txid": "0000000000000000000000000000000000000000000000000000000000000002",
+                "vout": 0,
+                "amount": 0.0005,   // 50_000 sats
+            }),
+            json!({
+                "txid": "0000000000000000000000000000000000000000000000000000000000000003",
+                "vout": 0,
+                "amount": 0.002,    // 200_000 sats
+            }),
+        ];
+        // Need 60_000 sats → smallest covering UTXO is the 100_000-sat one.
+        let picked = pick_utxo(&unspent, 60_000).unwrap();
+        assert_eq!(picked.value_sat, 100_000);
+        // Need 300_000 sats → no single UTXO covers, must error out (slice 3
+        // territory: multi-UTXO selection).
+        assert!(pick_utxo(&unspent, 300_000).is_err());
     }
 
     #[test]

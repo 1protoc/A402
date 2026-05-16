@@ -189,6 +189,33 @@ pub enum WalEntry {
         #[serde(default)]
         settlement_id: Option<String>,
     },
+    /// Bitcoin slice 3A: a UTXO paid to the Vault's address was observed
+    /// (deposit, or genesis from `A402_BITCOIN_BOOTSTRAP_UTXOS`).
+    BtcUtxoAdded {
+        /// 32-byte hex, no `0x` prefix (matches bitcoind's wire format).
+        txid: String,
+        vout: u32,
+        value_sat: u64,
+        /// `deposit` | `change` | `bootstrap` — provenance label, useful for
+        /// auditing but not load-bearing for state machine correctness.
+        #[serde(default)]
+        source: Option<String>,
+    },
+    /// A Vault UTXO was consumed as an input to a batch settlement.
+    BtcUtxoSpent {
+        txid: String,
+        vout: u32,
+        /// Txid of the settlement transaction that spent this UTXO. Lets
+        /// the receipt watchtower correlate spend with batch.
+        in_settlement_txid: String,
+    },
+    /// A batch settlement produced a change output back to the Vault. Logged
+    /// alongside `BtcUtxoSpent` so the ledger is mass-balanced after replay.
+    BtcChangeCreated {
+        txid: String,
+        vout: u32,
+        value_sat: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -843,6 +870,14 @@ async fn replay_entry(state: &AppState, entry: WalEntry) -> Result<(), String> {
                 })
                 .transpose()?;
 
+            // Resolve chain_kind eagerly so we can still consume `network` by
+            // value into the ProviderRegistration below.
+            let resolved_chain_kind = chain_kind.unwrap_or_else(|| {
+                crate::chain_adapter::parse_network(&network)
+                    .map(|descriptor| format!("{:?}", descriptor.kind).to_ascii_lowercase())
+                    .unwrap_or_default()
+            });
+
             state.vault.providers.insert(
                 provider_id.clone(),
                 ProviderRegistration {
@@ -862,11 +897,7 @@ async fn replay_entry(state: &AppState, entry: WalEntry) -> Result<(), String> {
                     settlement_address: settlement_address
                         .unwrap_or_else(|| target.settlement_address.clone()),
                     asset_id: asset_id.unwrap_or_else(|| target.asset_id.clone()),
-                    chain_kind: chain_kind.unwrap_or_else(|| {
-                        crate::chain_adapter::parse_network(&network)
-                            .map(|descriptor| format!("{:?}", descriptor.kind).to_ascii_lowercase())
-                            .unwrap_or_default()
-                    }),
+                    chain_kind: resolved_chain_kind,
                 },
             );
         }
@@ -1027,10 +1058,54 @@ async fn replay_entry(state: &AppState, entry: WalEntry) -> Result<(), String> {
             asc_manager::close_channel_with_settlement_id(&state.vault, &channel_id, settlement_id)
                 .map_err(wal_replay_error)?;
         }
+        WalEntry::BtcUtxoAdded {
+            txid,
+            vout,
+            value_sat,
+            ..
+        } => {
+            let parsed = parse_btc_txid(&txid)?;
+            let key = crate::btc_ledger::UtxoKey::new(parsed, vout);
+            state
+                .btc_ledger
+                .write()
+                .await
+                .add(key, value_sat)
+                .map_err(|e| format!("WAL replay BtcUtxoAdded: {e}"))?;
+        }
+        WalEntry::BtcChangeCreated {
+            txid,
+            vout,
+            value_sat,
+        } => {
+            let parsed = parse_btc_txid(&txid)?;
+            let key = crate::btc_ledger::UtxoKey::new(parsed, vout);
+            state
+                .btc_ledger
+                .write()
+                .await
+                .add(key, value_sat)
+                .map_err(|e| format!("WAL replay BtcChangeCreated: {e}"))?;
+        }
+        WalEntry::BtcUtxoSpent { txid, vout, .. } => {
+            let parsed = parse_btc_txid(&txid)?;
+            let key = crate::btc_ledger::UtxoKey::new(parsed, vout);
+            state
+                .btc_ledger
+                .write()
+                .await
+                .spend(&key)
+                .map_err(|e| format!("WAL replay BtcUtxoSpent: {e}"))?;
+        }
         _ => {}
     }
 
     Ok(())
+}
+
+fn parse_btc_txid(s: &str) -> Result<a402_shared::bitcoin::Txid, String> {
+    s.parse::<a402_shared::bitcoin::Txid>()
+        .map_err(|e| format!("invalid BTC txid in WAL: {e}"))
 }
 
 fn parse_pubkey(field: &str, value: &str) -> Result<Pubkey, String> {

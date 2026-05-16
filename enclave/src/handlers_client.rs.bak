@@ -1,0 +1,777 @@
+//! Client-facing Vault HTTP surface.
+//!
+//! In the paper's flow the Client (C) does **not** talk to the Service
+//! Provider (S) directly. Instead, the Vault (U) acts as C's TEE-backed
+//! delegate: U opens the on-chain channel with S, forwards C's per-request
+//! intents to S, locally verifies every commitment S returns
+//! (`σ̂_S` Schnorr pre-sig, `EncRes`), and decrypts the result for C only
+//! after the atomic exchange completes. This module implements that
+//! delegation as four HTTP routes:
+//!
+//!   - `POST /v1/client/open`     — open + register channel on C's behalf
+//!   - `POST /v1/client/request`  — proxy request to S, verify σ̂_S, emit
+//!                                   402-style envelope C must sign
+//!   - `POST /v1/client/pay`      — submit C's `σ_C`, finalize with S, return
+//!                                   decrypted plaintext to C
+//!   - `POST /v1/client/close`    — cooperative `closeASC` using the cached
+//!                                   `σ_S` from the last successful pay
+//!
+//! Vault's per-channel state (SP URL, seller pubkey, pending pre-sig, last
+//! `σ_S`) lives in a process-local `DashMap` keyed by `cid`. This is
+//! deliberately separate from the SP-side `evm_channel_store` in `shared/`:
+//! the two roles maintain disjoint views of the same channel.
+
+use std::sync::OnceLock;
+
+use axum::extract::Json;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use dashmap::DashMap;
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+use a402_shared::adaptor_sig_secp::{
+    self, AdaptorPreSignature, EncryptedResult,
+};
+use a402_shared::evm_chain::{self, Address, Bytes32};
+use a402_shared::evm_channel_store::{store as sp_store, EvmChannelRecord};
+use k256::ProjectivePoint;
+
+use crate::handlers_evm::{try_load_evm_context, RECEIPT_MAX_POLLS};
+
+/* -------------------------------------------------------------------------- */
+/*                            Per-channel state (Vault view)                   */
+/* -------------------------------------------------------------------------- */
+
+#[derive(Debug, Clone)]
+struct ClientChannelState {
+    sp_base_url: String,
+    buyer: Address,
+    seller: Address,
+    seller_pubkey: ProjectivePoint,
+    total_deposit: u128,
+    balance_c: u128,
+    balance_s: u128,
+    version: u64,
+    /// Pending commitment between `request` and `pay`. Cleared after
+    /// successful pay or aborted by a fresh request that supersedes it.
+    pending: Option<PendingExchange>,
+    /// Most recent finalized state's σ_S — needed for cooperative close.
+    last_sig_s: Option<Vec<u8>>,
+    last_sig_c: Option<Vec<u8>>,
+    /// SP-side identity used in `/v1/sp/register-vault`. Pinned at open time.
+    sp_vault_uid: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingExchange {
+    new_balance_c: u128,
+    new_balance_s: u128,
+    new_version: u64,
+    asc_state_hash: Bytes32,
+    pre_sig: AdaptorPreSignature,
+    big_t: ProjectivePoint,
+    enc_res: EncryptedResult,
+}
+
+fn store() -> &'static DashMap<Bytes32, ClientChannelState> {
+    static STORE: OnceLock<DashMap<Bytes32, ClientChannelState>> = OnceLock::new();
+    STORE.get_or_init(DashMap::new)
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                  Errors                                     */
+/* -------------------------------------------------------------------------- */
+
+pub enum ClientHandlerError {
+    BadRequest(String),
+    NotFound(String),
+    Conflict(String),
+    Chain(String),
+    UpstreamSp(String),
+    Internal(String),
+}
+
+impl IntoResponse for ClientHandlerError {
+    fn into_response(self) -> Response {
+        let (status, msg) = match self {
+            ClientHandlerError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            ClientHandlerError::NotFound(m) => (StatusCode::NOT_FOUND, m),
+            ClientHandlerError::Conflict(m) => (StatusCode::CONFLICT, m),
+            ClientHandlerError::Chain(m) => (StatusCode::BAD_GATEWAY, m),
+            ClientHandlerError::UpstreamSp(m) => (StatusCode::BAD_GATEWAY, m),
+            ClientHandlerError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+        };
+        (status, Json(json!({"error": msg}))).into_response()
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                Wire types                                   */
+/* -------------------------------------------------------------------------- */
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenRequest {
+    /// Client's EOA address. Must match the buyer the Client will sign with.
+    pub client: String,
+    /// SP base URL (e.g. http://127.0.0.1:3700).
+    pub sp_base_url: String,
+    /// Total deposit in USDC-atomic units. Must exceed at least one request.
+    pub deposit: String,
+    /// Optional caller-supplied cid (32-byte hex). If absent, Vault samples one.
+    pub cid: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenResponse {
+    pub cid: String,
+    pub tx_hash: String,
+    pub block_number: u64,
+    pub seller_address: String,
+    pub seller_schnorr_px: String,
+    pub deposit: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestRequest {
+    pub cid: String,
+}
+
+/// 402-style envelope returned to Client. The Client must ECDSA-sign
+/// `ascStateHash` (eth-prefixed) and POST to `/v1/client/pay`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestResponse {
+    pub status: u16,
+    pub cid: String,
+    pub asc_state_hash: String,
+    pub new_balance_c: String,
+    pub new_balance_s: String,
+    pub new_version: u64,
+    /// Echoed back so the Client can compute / verify locally if desired.
+    pub seller_schnorr_px: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayRequest {
+    pub cid: String,
+    pub version: u64,
+    /// Client's eth-prefixed ECDSA signature over `ascStateHash` (`σ_C`).
+    pub sig_c: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayResponse {
+    pub cid: String,
+    pub version: u64,
+    /// Decrypted service plaintext.
+    pub plaintext: String,
+    pub new_balance_c: String,
+    pub new_balance_s: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseRequest {
+    pub cid: String,
+    /// Client's eth-prefixed ECDSA over the most recent `ascStateHash`.
+    pub sig_c: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseResponse {
+    pub cid: String,
+    pub tx_hash: String,
+    pub block_number: u64,
+    pub balance_c: String,
+    pub balance_s: String,
+    pub version: u64,
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              Handler: open                                  */
+/* -------------------------------------------------------------------------- */
+
+pub async fn post_client_open(
+    Json(req): Json<OpenRequest>,
+) -> Result<Json<OpenResponse>, ClientHandlerError> {
+    let asc = try_load_evm_context()
+        .await
+        .map_err(ClientHandlerError::BadRequest)?
+        .ok_or_else(|| {
+            ClientHandlerError::BadRequest("EVM context not configured".to_string())
+        })?;
+
+    let client_addr =
+        Address::parse(&req.client).map_err(|e| ClientHandlerError::BadRequest(e.to_string()))?;
+    let deposit: u128 = req
+        .deposit
+        .parse()
+        .map_err(|e: std::num::ParseIntError| {
+            ClientHandlerError::BadRequest(format!("deposit: {e}"))
+        })?;
+    if deposit == 0 {
+        return Err(ClientHandlerError::BadRequest("deposit must be > 0".into()));
+    }
+
+    let cid = match req.cid {
+        Some(hex) => Bytes32::parse(&hex)
+            .map_err(|e| ClientHandlerError::BadRequest(e.to_string()))?,
+        None => {
+            let mut buf = [0u8; 32];
+            rand::thread_rng().fill(&mut buf);
+            Bytes32(buf)
+        }
+    };
+
+    // 1. Discover SP identity via /v1/sp/info.
+    let http = build_http()?;
+    let info: SpInfo = http
+        .get(format!("{}/v1/sp/info", req.sp_base_url.trim_end_matches('/')))
+        .send()
+        .await
+        .map_err(|e| ClientHandlerError::UpstreamSp(format!("/v1/sp/info GET: {e}")))?
+        .json::<SpInfo>()
+        .await
+        .map_err(|e| ClientHandlerError::UpstreamSp(format!("/v1/sp/info decode: {e}")))?;
+    let seller_addr = Address::parse(&info.address)
+        .map_err(|e| ClientHandlerError::UpstreamSp(format!("sp.address: {e}")))?;
+    let seller_pubkey = reconstruct_seller_pubkey(&info.schnorr_px)
+        .map_err(ClientHandlerError::UpstreamSp)?;
+
+    // 2. Register self into SP's Reg_U. Idempotent: a duplicate
+    //    `register-vault` for the same uid returns 200 with the existing
+    //    record, so this is safe to retry.
+    let sp_vault_uid = format!("vault-{}", asc.vault_eoa.to_hex());
+    let resp = http
+        .post(format!("{}/v1/sp/register-vault", req.sp_base_url.trim_end_matches('/')))
+        .json(&json!({
+            "uid": sp_vault_uid,
+            "vaultEoa": asc.vault_eoa.to_hex(),
+        }))
+        .send()
+        .await
+        .map_err(|e| ClientHandlerError::UpstreamSp(format!("/v1/sp/register-vault POST: {e}")))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ClientHandlerError::UpstreamSp(format!(
+            "register-vault returned {status}: {body}"
+        )));
+    }
+
+    // 3. Submit createASC on chain.
+    let tx_hash = asc
+        .create_asc(&cid, &client_addr, &seller_addr, deposit)
+        .await
+        .map_err(|e| ClientHandlerError::Chain(e.to_string()))?;
+    let receipt = asc
+        .rpc
+        .wait_receipt(&tx_hash, RECEIPT_MAX_POLLS)
+        .await
+        .map_err(|e| ClientHandlerError::Chain(e.to_string()))?;
+
+    // 4. Register the channel on the SP side now that on-chain state exists.
+    let resp = http
+        .post(format!("{}/v1/sp/register", req.sp_base_url.trim_end_matches('/')))
+        .json(&json!({
+            "cid": cid.to_hex(),
+            "buyer": client_addr.to_hex(),
+            "totalDeposit": deposit.to_string(),
+            "vaultUid": sp_vault_uid,
+        }))
+        .send()
+        .await
+        .map_err(|e| ClientHandlerError::UpstreamSp(format!("/v1/sp/register POST: {e}")))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ClientHandlerError::UpstreamSp(format!(
+            "sp /register returned {status}: {body}"
+        )));
+    }
+
+    // 5. Mirror into both stores.
+    sp_store().insert_channel(
+        &cid,
+        EvmChannelRecord::new(client_addr, seller_addr, deposit),
+    );
+    store().insert(
+        cid,
+        ClientChannelState {
+            sp_base_url: req.sp_base_url.trim_end_matches('/').to_string(),
+            buyer: client_addr,
+            seller: seller_addr,
+            seller_pubkey,
+            total_deposit: deposit,
+            balance_c: deposit,
+            balance_s: 0,
+            version: 0,
+            pending: None,
+            last_sig_s: None,
+            last_sig_c: None,
+            sp_vault_uid,
+        },
+    );
+
+    Ok(Json(OpenResponse {
+        cid: cid.to_hex(),
+        tx_hash,
+        block_number: receipt.block_number_u64(),
+        seller_address: seller_addr.to_hex(),
+        seller_schnorr_px: info.schnorr_px,
+        deposit: deposit.to_string(),
+    }))
+}
+
+/* -------------------------------------------------------------------------- */
+/*                            Handler: request (HTTP 402-style)                */
+/* -------------------------------------------------------------------------- */
+
+pub async fn post_client_request(
+    Json(req): Json<RequestRequest>,
+) -> Result<(StatusCode, Json<RequestResponse>), ClientHandlerError> {
+    let cid =
+        Bytes32::parse(&req.cid).map_err(|e| ClientHandlerError::BadRequest(e.to_string()))?;
+    let entry = store()
+        .get(&cid)
+        .ok_or_else(|| ClientHandlerError::NotFound("unknown cid".to_string()))?
+        .clone();
+
+    let http = build_http()?;
+    let resp = http
+        .post(format!("{}/v1/sp/request", entry.sp_base_url))
+        .json(&json!({"cid": cid.to_hex()}))
+        .send()
+        .await
+        .map_err(|e| ClientHandlerError::UpstreamSp(format!("/v1/sp/request POST: {e}")))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ClientHandlerError::UpstreamSp(format!(
+            "sp /request returned {status}: {body}"
+        )));
+    }
+    let atomic: SpAtomicResp = resp.json().await.map_err(|e| {
+        ClientHandlerError::UpstreamSp(format!("/v1/sp/request decode: {e}"))
+    })?;
+
+    // Parse + verify σ̂_S locally before exposing anything to the Client.
+    let asc_state_hash = parse_b32(&atomic.asc_state_hash, "ascStateHash")?;
+    let new_balance_c: u128 = atomic
+        .new_balance_c
+        .parse()
+        .map_err(|e: std::num::ParseIntError| {
+            ClientHandlerError::UpstreamSp(format!("newBalanceC: {e}"))
+        })?;
+    let new_balance_s: u128 = atomic
+        .new_balance_s
+        .parse()
+        .map_err(|e: std::num::ParseIntError| {
+            ClientHandlerError::UpstreamSp(format!("newBalanceS: {e}"))
+        })?;
+
+    let big_t_bytes = parse_b33(&atomic.big_t, "bigT")?;
+    let big_t = adaptor_sig_secp::decompress_point(&big_t_bytes)
+        .ok_or_else(|| ClientHandlerError::UpstreamSp("bigT not on curve".to_string()))?;
+    let r_prime = parse_b33(&atomic.sig_hat_r_prime, "sigHatRPrime")?;
+    let s_prime = parse_b32(&atomic.sig_hat_s_prime, "sigHatSPrime")?;
+    let pre_sig = AdaptorPreSignature { r_prime, s_prime };
+
+    if !adaptor_sig_secp::p_verify(&entry.seller_pubkey, &asc_state_hash, &big_t, &pre_sig) {
+        return Err(ClientHandlerError::UpstreamSp(
+            "SP produced invalid σ̂_S — refusing to forward to client".to_string(),
+        ));
+    }
+
+    let iv = parse_fixed::<12>(&atomic.enc_iv, "encIv")?;
+    let tag = parse_fixed::<16>(&atomic.enc_tag, "encTag")?;
+    let ciphertext = parse_hex(&atomic.enc_ciphertext, "encCiphertext")?;
+    let enc_res = EncryptedResult {
+        iv,
+        ciphertext,
+        tag,
+    };
+
+    // Sanity: SP must charge exactly one unit and conserve total deposit.
+    if new_balance_c + new_balance_s != entry.total_deposit {
+        return Err(ClientHandlerError::UpstreamSp(
+            "balance not conserved".to_string(),
+        ));
+    }
+    if new_balance_c >= entry.balance_c {
+        return Err(ClientHandlerError::UpstreamSp(
+            "SP did not debit client".to_string(),
+        ));
+    }
+    if atomic.new_version != entry.version + 1 {
+        return Err(ClientHandlerError::UpstreamSp(format!(
+            "version jump: expected {}, got {}",
+            entry.version + 1,
+            atomic.new_version
+        )));
+    }
+
+    // Park.
+    store().alter(&cid, |_, mut state| {
+        state.pending = Some(PendingExchange {
+            new_balance_c,
+            new_balance_s,
+            new_version: atomic.new_version,
+            asc_state_hash: Bytes32(asc_state_hash),
+            pre_sig,
+            big_t,
+            enc_res,
+        });
+        state
+    });
+
+    let envelope = RequestResponse {
+        status: 402,
+        cid: cid.to_hex(),
+        asc_state_hash: format!("0x{}", hex::encode(asc_state_hash)),
+        new_balance_c: new_balance_c.to_string(),
+        new_balance_s: new_balance_s.to_string(),
+        new_version: atomic.new_version,
+        seller_schnorr_px: {
+            // Re-emit the px the Client originally got from /open — never
+            // trust the SP to change identity mid-channel.
+            use k256::elliptic_curve::sec1::ToEncodedPoint;
+            let aff = entry.seller_pubkey.to_affine().to_encoded_point(true);
+            let bytes = aff.as_bytes();
+            // SEC1 compressed: [parity, X..]. Strip parity for px display.
+            format!("0x{}", hex::encode(&bytes[1..]))
+        },
+    };
+    Ok((StatusCode::PAYMENT_REQUIRED, Json(envelope)))
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              Handler: pay                                   */
+/* -------------------------------------------------------------------------- */
+
+pub async fn post_client_pay(
+    Json(req): Json<PayRequest>,
+) -> Result<Json<PayResponse>, ClientHandlerError> {
+    let cid =
+        Bytes32::parse(&req.cid).map_err(|e| ClientHandlerError::BadRequest(e.to_string()))?;
+    let entry = store()
+        .get(&cid)
+        .ok_or_else(|| ClientHandlerError::NotFound("unknown cid".to_string()))?
+        .clone();
+    let pending = entry
+        .pending
+        .clone()
+        .ok_or_else(|| ClientHandlerError::Conflict("no pending request to pay".to_string()))?;
+    if pending.new_version != req.version {
+        return Err(ClientHandlerError::Conflict(format!(
+            "version mismatch: pending {}, got {}",
+            pending.new_version, req.version
+        )));
+    }
+
+    let sig_c = decode_sig(&req.sig_c, "sigC")?;
+    // Reject obviously-wrong σ_C before bothering SP.
+    let recovered = ecdsa_recover_eth_message(&pending.asc_state_hash, &sig_c)
+        .map_err(ClientHandlerError::BadRequest)?;
+    if recovered != entry.buyer {
+        return Err(ClientHandlerError::BadRequest(format!(
+            "σ_C recovered to {}, expected buyer {}",
+            recovered.to_hex(),
+            entry.buyer.to_hex()
+        )));
+    }
+
+    // Forward finalize to SP.
+    let http = build_http()?;
+    let resp = http
+        .post(format!("{}/v1/sp/finalize", entry.sp_base_url))
+        .json(&json!({
+            "cid": cid.to_hex(),
+            "version": req.version,
+            "sigC": format!("0x{}", hex::encode(&sig_c)),
+        }))
+        .send()
+        .await
+        .map_err(|e| ClientHandlerError::UpstreamSp(format!("/v1/sp/finalize POST: {e}")))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ClientHandlerError::UpstreamSp(format!(
+            "sp /finalize returned {status}: {body}"
+        )));
+    }
+    let fin: SpFinalizeResp = resp.json().await.map_err(|e| {
+        ClientHandlerError::UpstreamSp(format!("/v1/sp/finalize decode: {e}"))
+    })?;
+
+    let t_bytes = parse_b32(&fin.t, "t")?;
+    let t = adaptor_sig_secp::scalar_from_be_bytes_strict(&t_bytes)
+        .ok_or_else(|| ClientHandlerError::UpstreamSp("t out of order".to_string()))?;
+
+    // t·G must equal T from the request envelope.
+    let big_t_check = ProjectivePoint::GENERATOR * t;
+    if big_t_check != pending.big_t {
+        return Err(ClientHandlerError::UpstreamSp(
+            "revealed t does not match T".to_string(),
+        ));
+    }
+    // adapt + verify_full.
+    let full = adaptor_sig_secp::adapt(&pending.pre_sig, &t)
+        .map_err(|e| ClientHandlerError::Internal(format!("adapt: {e}")))?;
+    if !adaptor_sig_secp::verify_full(&entry.seller_pubkey, &pending.asc_state_hash.0, &full) {
+        return Err(ClientHandlerError::UpstreamSp(
+            "adapted σ_S fails verify_full".to_string(),
+        ));
+    }
+    let plaintext = adaptor_sig_secp::decrypt_result(&pending.enc_res, &t)
+        .map_err(|_| ClientHandlerError::UpstreamSp("decrypt failed".to_string()))?;
+    let plaintext_str = String::from_utf8(plaintext)
+        .map_err(|e| ClientHandlerError::UpstreamSp(format!("plaintext utf8: {e}")))?;
+
+    let sig_s_bytes = decode_sig(&fin.sig_s, "sigS")?;
+
+    // Commit.
+    store().alter(&cid, |_, mut state| {
+        state.balance_c = pending.new_balance_c;
+        state.balance_s = pending.new_balance_s;
+        state.version = pending.new_version;
+        state.last_sig_s = Some(sig_s_bytes);
+        state.last_sig_c = Some(sig_c.clone());
+        state.pending = None;
+        state
+    });
+
+    Ok(Json(PayResponse {
+        cid: cid.to_hex(),
+        version: pending.new_version,
+        plaintext: plaintext_str,
+        new_balance_c: pending.new_balance_c.to_string(),
+        new_balance_s: pending.new_balance_s.to_string(),
+    }))
+}
+
+/* -------------------------------------------------------------------------- */
+/*                             Handler: close                                  */
+/* -------------------------------------------------------------------------- */
+
+pub async fn post_client_close(
+    Json(req): Json<CloseRequest>,
+) -> Result<Json<CloseResponse>, ClientHandlerError> {
+    let asc = try_load_evm_context()
+        .await
+        .map_err(ClientHandlerError::BadRequest)?
+        .ok_or_else(|| ClientHandlerError::BadRequest("EVM context not configured".into()))?;
+
+    let cid =
+        Bytes32::parse(&req.cid).map_err(|e| ClientHandlerError::BadRequest(e.to_string()))?;
+    let entry = store()
+        .get(&cid)
+        .ok_or_else(|| ClientHandlerError::NotFound("unknown cid".to_string()))?
+        .clone();
+    let sig_s = entry.last_sig_s.clone().ok_or_else(|| {
+        ClientHandlerError::Conflict("no σ_S to close with (no successful pay yet)".into())
+    })?;
+
+    let sig_c = decode_sig(&req.sig_c, "sigC")?;
+    let final_state_hash =
+        evm_chain::asc_state_hash(&asc.address, &cid, entry.balance_c, entry.balance_s, entry.version);
+    let recovered = ecdsa_recover_eth_message(&final_state_hash, &sig_c)
+        .map_err(ClientHandlerError::BadRequest)?;
+    if recovered != entry.buyer {
+        return Err(ClientHandlerError::BadRequest(format!(
+            "σ_C recovered to {}, expected buyer {}",
+            recovered.to_hex(),
+            entry.buyer.to_hex()
+        )));
+    }
+
+    let tx_hash = asc
+        .close_asc(&cid, entry.balance_c, entry.balance_s, entry.version, &sig_c, &sig_s)
+        .await
+        .map_err(|e| ClientHandlerError::Chain(e.to_string()))?;
+    let receipt = asc
+        .rpc
+        .wait_receipt(&tx_hash, RECEIPT_MAX_POLLS)
+        .await
+        .map_err(|e| ClientHandlerError::Chain(e.to_string()))?;
+
+    Ok(Json(CloseResponse {
+        cid: cid.to_hex(),
+        tx_hash,
+        block_number: receipt.block_number_u64(),
+        balance_c: entry.balance_c.to_string(),
+        balance_s: entry.balance_s.to_string(),
+        version: entry.version,
+    }))
+}
+
+/* -------------------------------------------------------------------------- */
+/*                             Inner SP wire types                             */
+/* -------------------------------------------------------------------------- */
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpInfo {
+    address: String,
+    schnorr_px: String,
+    #[allow(dead_code)]
+    asc_manager: String,
+    #[allow(dead_code)]
+    vault_addr: String,
+    #[allow(dead_code)]
+    registered_vaults: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpAtomicResp {
+    #[allow(dead_code)]
+    cid: String,
+    asc_state_hash: String,
+    new_balance_c: String,
+    new_balance_s: String,
+    new_version: u64,
+    big_t: String,
+    sig_hat_r_prime: String,
+    sig_hat_s_prime: String,
+    enc_iv: String,
+    enc_ciphertext: String,
+    enc_tag: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpFinalizeResp {
+    #[allow(dead_code)]
+    cid: String,
+    #[allow(dead_code)]
+    version: u64,
+    t: String,
+    sig_s: String,
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                  Helpers                                    */
+/* -------------------------------------------------------------------------- */
+
+fn build_http() -> Result<reqwest::Client, ClientHandlerError> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| ClientHandlerError::Internal(format!("reqwest::Client::build: {e}")))
+}
+
+fn reconstruct_seller_pubkey(schnorr_px_hex: &str) -> Result<ProjectivePoint, String> {
+    let stripped = schnorr_px_hex.strip_prefix("0x").unwrap_or(schnorr_px_hex);
+    let raw = hex::decode(stripped).map_err(|e| format!("schnorrPx hex: {e}"))?;
+    if raw.len() != 32 {
+        return Err(format!("schnorrPx must be 32 bytes, got {}", raw.len()));
+    }
+    let mut compressed = [0u8; 33];
+    compressed[0] = 0x02;
+    compressed[1..].copy_from_slice(&raw);
+    adaptor_sig_secp::decompress_point(&compressed)
+        .ok_or_else(|| "schnorrPx not on curve under even-y".to_string())
+}
+
+fn parse_hex(input: &str, label: &str) -> Result<Vec<u8>, ClientHandlerError> {
+    let stripped = input.strip_prefix("0x").unwrap_or(input);
+    hex::decode(stripped).map_err(|e| ClientHandlerError::UpstreamSp(format!("{label}: {e}")))
+}
+
+fn parse_b32(input: &str, label: &str) -> Result<[u8; 32], ClientHandlerError> {
+    let raw = parse_hex(input, label)?;
+    if raw.len() != 32 {
+        return Err(ClientHandlerError::UpstreamSp(format!(
+            "{label} must be 32 bytes, got {}",
+            raw.len()
+        )));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&raw);
+    Ok(out)
+}
+
+fn parse_b33(input: &str, label: &str) -> Result<[u8; 33], ClientHandlerError> {
+    let raw = parse_hex(input, label)?;
+    if raw.len() != 33 {
+        return Err(ClientHandlerError::UpstreamSp(format!(
+            "{label} must be 33 bytes, got {}",
+            raw.len()
+        )));
+    }
+    let mut out = [0u8; 33];
+    out.copy_from_slice(&raw);
+    Ok(out)
+}
+
+fn parse_fixed<const N: usize>(input: &str, label: &str) -> Result<[u8; N], ClientHandlerError> {
+    let raw = parse_hex(input, label)?;
+    if raw.len() != N {
+        return Err(ClientHandlerError::UpstreamSp(format!(
+            "{label} must be {N} bytes, got {}",
+            raw.len()
+        )));
+    }
+    let mut out = [0u8; N];
+    out.copy_from_slice(&raw);
+    Ok(out)
+}
+
+fn decode_sig(hex_value: &str, label: &str) -> Result<Vec<u8>, ClientHandlerError> {
+    let raw = parse_hex(hex_value, label)?;
+    if raw.len() != 65 {
+        return Err(ClientHandlerError::BadRequest(format!(
+            "{label} must be 65 bytes (r||s||v), got {}",
+            raw.len()
+        )));
+    }
+    Ok(raw)
+}
+
+fn ecdsa_recover_eth_message(digest: &Bytes32, sig65: &[u8]) -> Result<Address, String> {
+    use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+    use sha3::{Digest, Keccak256};
+    if sig65.len() != 65 {
+        return Err(format!("signature must be 65 bytes, got {}", sig65.len()));
+    }
+    let mut rs = [0u8; 64];
+    rs.copy_from_slice(&sig65[..64]);
+    let v = sig65[64];
+    let recovery = match v {
+        27 | 0 => 0u8,
+        28 | 1 => 1u8,
+        _ => return Err(format!("invalid recovery v={v}")),
+    };
+    let sig =
+        Signature::from_slice(&rs).map_err(|e| format!("Signature::from_slice: {e}"))?;
+    let rid = RecoveryId::try_from(recovery)
+        .map_err(|e| format!("RecoveryId::try_from: {e}"))?;
+    let mut prefixed = Vec::with_capacity(28 + 32);
+    prefixed.extend_from_slice(b"\x19Ethereum Signed Message:\n32");
+    prefixed.extend_from_slice(&digest.0);
+    let mut hasher = Keccak256::new();
+    hasher.update(&prefixed);
+    let eth_digest = hasher.finalize();
+    let mut prehash = [0u8; 32];
+    prehash.copy_from_slice(&eth_digest);
+    let recovered = VerifyingKey::recover_from_prehash(&prehash, &sig, rid)
+        .map_err(|e| format!("recover_from_prehash: {e}"))?;
+    let encoded = recovered.to_encoded_point(false);
+    let xy = &encoded.as_bytes()[1..];
+    let mut h = Keccak256::new();
+    h.update(xy);
+    let d = h.finalize();
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&d[12..32]);
+    Ok(Address(addr))
+}

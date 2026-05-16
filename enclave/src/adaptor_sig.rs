@@ -1,7 +1,7 @@
 //! Ed25519 Adaptor Signatures for Atomic Service Channels (Phase 3)
 //!
 //! Implements the adaptor signature scheme on Ed25519 (Aumayr et al., 2021)
-//! for Exec-Pay-Deliver atomicity per design doc §5.5.
+//! for Exec-Pay-Deliver atomicity 
 //!
 //! Protocol:
 //!   1. Signer picks random r, computes R' = r·G

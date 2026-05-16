@@ -6,8 +6,12 @@ mod asc_manager;
 mod attestation;
 mod audit;
 mod batch;
+mod btc_deposit_detector;
+mod btc_ledger;
 mod chain_adapter;
 mod deposit_detector;
+mod handlers_client;
+mod handlers_evm;
 mod error;
 mod handlers;
 mod interconnect;
@@ -15,6 +19,7 @@ mod kms_bootstrap;
 mod multichain_settlement;
 mod outbound;
 mod provider_attestation;
+mod raft_setup;
 mod snapshot;
 mod snapshot_store;
 mod state;
@@ -150,6 +155,7 @@ async fn main() {
         attestation_is_local_dev: bootstrap.attestation.is_local_dev,
         provider_mtls_enabled,
         outbound,
+        btc_ledger: tokio::sync::RwLock::new(btc_ledger::BtcUtxoLedger::new()),
     });
 
     let snapshot_manager = snapshot_store
@@ -179,9 +185,37 @@ async fn main() {
     // Spawn deposit detection (monitors on-chain deposits to update client balances)
     deposit_detector::spawn_deposit_detector(app_state.clone(), deposit_detector);
 
+    // Optional Bitcoin deposit detector (slice 3B). Skipped when
+    // A402_BITCOIN_RPC_URL / A402_BITCOIN_VAULT_PRIV aren't set.
+    match btc_deposit_detector::BtcDepositDetector::from_env() {
+        Ok(Some(det)) => {
+            btc_deposit_detector::spawn_detector(det, app_state.clone());
+            info!("Bitcoin deposit detector spawned");
+        }
+        Ok(None) => {}
+        Err(e) => panic!("BTC deposit detector env error: {e}"),
+    }
+
     if let Some(manager) = snapshot_manager {
         manager.spawn_background_task(app_state.clone());
     }
+
+    // Optional Raft committee bootstrap (slice 2B).
+    // `A402_RAFT_PEERS` empty/unset → single-node legacy path, no change.
+    // Non-empty → bring up RaftCommittee, serve raft RPCs on
+    // `A402_RAFT_LISTEN`; slice 2C will route /v1/verify and /v1/settle
+    // mutations through the committee before returning 200.
+    let _raft_committee = match raft_setup::RaftEnv::from_env() {
+        Ok(Some(env)) => match raft_setup::start_committee(env).await {
+            Ok(c) => Some(c),
+            Err(e) => panic!("raft committee bring-up failed: {e}"),
+        },
+        Ok(None) => {
+            info!("A402_RAFT_PEERS empty → running Vault in single-node mode");
+            None
+        }
+        Err(e) => panic!("raft env parse error: {e}"),
+    };
 
     let mut app = Router::new()
         .route("/v1/attestation", get(handlers::get_attestation))
@@ -203,7 +237,45 @@ async fn main() {
             "/v1/channel/finalize",
             post(handlers::post_channel_finalize),
         )
-        .route("/v1/channel/close", post(handlers::post_channel_close));
+        .route("/v1/channel/close", post(handlers::post_channel_close))
+        // Phase C: EVM ASC channel endpoints — independent of the Solana
+        // routes above; mounted unconditionally so callers can probe and
+        // receive HTTP 503 when the EVM env vars aren't configured.
+        .route(
+            "/v1/channel/evm/open",
+            post(handlers_evm::post_channel_evm_open),
+        )
+        .route(
+            "/v1/channel/evm/close",
+            post(handlers_evm::post_channel_evm_close),
+        )
+        .route(
+            "/v1/channel/evm/:cid",
+            get(handlers_evm::get_channel_evm_state),
+        )
+        // The Vault's contribution to a Service Provider force-close —
+        // produces σ_U over an already (buyer+seller)-signed ascStateHash.
+        // SP-role endpoints (register / request / finalize / force-close)
+        // moved to the `service_provider/` binary in the role split.
+        .route(
+            "/v1/channel/evm/state-sig",
+            post(handlers_evm::post_channel_evm_state_sig),
+        )
+        // Client-facing delegation routes. The
+        // Vault acts as C's TEE-backed proxy: opens the on-chain channel,
+        // forwards per-request intents to the SP, verifies σ̂_S /
+        // decrypts EncRes locally, and returns the plaintext to C only
+        // after the atomic exchange completes.
+        .route("/v1/client/open", post(handlers_client::post_client_open))
+        .route(
+            "/v1/client/request",
+            post(handlers_client::post_client_request),
+        )
+        .route("/v1/client/pay", post(handlers_client::post_client_pay))
+        .route(
+            "/v1/client/close",
+            post(handlers_client::post_client_close),
+        );
     if enable_provider_registration_api {
         let provider_registration_routes = Router::new()
             .route(

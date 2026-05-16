@@ -69,6 +69,10 @@ pub struct AppState {
     pub attestation_is_local_dev: bool,
     pub provider_mtls_enabled: bool,
     pub outbound: OutboundTransport,
+    /// WAL-tracked UTXO ledger for the Bitcoin settlement path (slice 3A).
+    /// Empty / unused on Solana-only deployments. Slice 3C will source
+    /// settlement inputs from here instead of `listunspent`.
+    pub btc_ledger: tokio::sync::RwLock<crate::btc_ledger::BtcUtxoLedger>,
 }
 
 // ── Attestation ──
@@ -160,7 +164,7 @@ pub struct VerifyRequest {
     pub request_context: RequestContext,
 }
 
-// ── Provider Authentication Helper (§8.2 requirement 1) ──
+// ── Provider Authentication Helper  ──
 
 fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
@@ -479,7 +483,7 @@ async fn ensure_open_provider_registered(
     Ok(())
 }
 
-/// Compute canonical JSON hash of payment details (§6, paymentDetailsHash).
+/// Compute canonical JSON hash of payment details .
 fn compute_payment_details_hash(details: &serde_json::Value) -> Vec<u8> {
     // canonical_json: UTF-8, keys in lexicographic order, no extra whitespace
     let canonical = canonical_json(details);
@@ -617,7 +621,7 @@ pub async fn post_verify(
         return Err(EnclaveError::InvalidScheme);
     }
 
-    // C7: Validate paymentDetailsHash via canonical JSON (§8.2 requirement 3).
+    // C7: Validate paymentDetailsHash via canonical JSON .
     // Registrationless providers rely on these signed details, so this runs
     // before provider lookup can auto-create an open seller entry.
     let computed_hash = compute_payment_details_hash(payment_details);
@@ -663,7 +667,7 @@ pub async fn post_verify(
 
     ensure_open_provider_registered(&state, payload).await?;
 
-    // C5: Authenticate provider from provider registration + headers (§8.2 requirement 1)
+    // C5: Authenticate provider from provider registration + headers 
     let authenticated_provider_id = authenticate_provider(&state, &headers, &payload.provider_id)?;
 
     // 2. Validate provider exists and matches authenticated identity
@@ -677,7 +681,7 @@ pub async fn post_verify(
         return Err(EnclaveError::ProviderIdMismatch);
     }
 
-    // C6: Validate registration fields match payload (§8.2 requirement 7)
+    // C6: Validate registration fields match payload 
     let registered_pay_to = if provider.settlement_address.is_empty() {
         provider.settlement_token_account.to_string()
     } else {
@@ -701,7 +705,7 @@ pub async fn post_verify(
         return Err(EnclaveError::NetworkMismatch);
     }
 
-    // C9: Validate request origin against provider allowedOrigins (§4)
+    // C9: Validate request origin against provider allowedOrigins 
     if !provider.allowed_origins.is_empty()
         && !provider
             .allowed_origins
@@ -895,7 +899,7 @@ pub async fn post_settle(
 
     ensure_vault_allows_existing_reservation_ops(&state).await?;
 
-    // C5: Authenticate provider (§8.3 — same auth as /verify)
+    // C5: Authenticate provider 
     let authenticated_provider_id = authenticate_provider(&state, &headers, &provider_id)?;
 
     // Verify authenticated provider owns this reservation
@@ -1147,10 +1151,10 @@ pub async fn post_cancel(
 
     ensure_vault_allows_existing_reservation_ops(&state).await?;
 
-    // C8: Authenticate provider (§8.5)
+    // C8: Authenticate provider 
     let authenticated_provider_id = authenticate_provider(&state, &headers, &provider_id)?;
 
-    // C8: Check provider_mismatch — only the provider that owns the reservation can cancel (§8.5)
+    // C8: Check provider_mismatch — only the provider that owns the reservation can cancel 
     if authenticated_provider_id != provider_id {
         return Err(EnclaveError::ProviderIdMismatch);
     }
@@ -2964,6 +2968,7 @@ mod tests {
                 attestation_is_local_dev: true,
                 provider_mtls_enabled,
                 outbound: crate::outbound::OutboundTransport::direct(),
+                btc_ledger: tokio::sync::RwLock::new(crate::btc_ledger::BtcUtxoLedger::new()),
             }),
             wal_path,
         )
@@ -4630,6 +4635,7 @@ mod tests {
             attestation_is_local_dev: true,
             provider_mtls_enabled: false,
             outbound: crate::outbound::OutboundTransport::direct(),
+            btc_ledger: tokio::sync::RwLock::new(crate::btc_ledger::BtcUtxoLedger::new()),
         });
 
         wal::replay_app_state(&replay_state).await.unwrap();
@@ -4716,6 +4722,7 @@ mod tests {
             attestation_is_local_dev: true,
             provider_mtls_enabled: false,
             outbound: crate::outbound::OutboundTransport::direct(),
+            btc_ledger: tokio::sync::RwLock::new(crate::btc_ledger::BtcUtxoLedger::new()),
         });
 
         let client_signing_key = SigningKey::generate(&mut OsRng);
@@ -4835,6 +4842,7 @@ mod tests {
             attestation_is_local_dev: true,
             provider_mtls_enabled: false,
             outbound: crate::outbound::OutboundTransport::direct(),
+            btc_ledger: tokio::sync::RwLock::new(crate::btc_ledger::BtcUtxoLedger::new()),
         });
 
         wal::replay_app_state(&replay_state).await.unwrap();
@@ -4958,6 +4966,7 @@ mod tests {
             attestation_is_local_dev: true,
             provider_mtls_enabled: false,
             outbound: crate::outbound::OutboundTransport::direct(),
+            btc_ledger: tokio::sync::RwLock::new(crate::btc_ledger::BtcUtxoLedger::new()),
         });
 
         wal::replay_app_state(&replay_state).await.unwrap();

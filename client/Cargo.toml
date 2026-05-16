@@ -1,0 +1,27 @@
+[package]
+name = "a402-client"
+version = "0.1.0"
+edition = "2021"
+description = "A402 Client (C) Rust library. Unlike the Vault (U) and Service Provider (S) it does NOT run in a TEE. This crate exposes the building blocks a Client needs to execute the atomic exchange: ECDSA σ_C signing over ascStateHash, Schnorr pre-signature verification, EncRes decryption, and a thin reqwest wrapper around the SP's /v1/sp/* HTTP surface."
+
+[lib]
+name = "a402_client"
+path = "src/lib.rs"
+
+[dependencies]
+a402-shared = { path = "../shared" }
+
+# HTTP + JSON
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Crypto
+k256 = { version = "0.13", features = ["arithmetic", "ecdsa"] }
+sha3 = "0.10"
+rand = "0.8"
+
+# Plumbing
+hex = "0.4"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "macros", "time"] }

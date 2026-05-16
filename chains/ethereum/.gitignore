@@ -1,0 +1,10 @@
+cache/
+out/
+broadcast/
+lib/
+deployments/*.json
+!deployments/.gitkeep
+
+# Anvil state dumps
+anvil_state.json
+.anvil.pid
